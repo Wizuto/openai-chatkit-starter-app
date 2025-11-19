@@ -1,283 +1,127 @@
-import { WORKFLOW_ID } from "@/lib/config";
+import { NextRequest, NextResponse } from 'next/server';
+import OpenAI from 'openai';
 
-export const runtime = "edge";
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
-interface CreateSessionRequestBody {
-  workflow?: { id?: string | null } | null;
-  scope?: { user_id?: string | null } | null;
-  workflowId?: string | null;
-  chatkit_configuration?: {
-    file_upload?: {
-      enabled?: boolean;
-    };
-  };
-}
+const AIRTABLE_BASE_ID = process.env.AIRTABLE_BASE_ID!;
+const AIRTABLE_TABLE_NAME = process.env.AIRTABLE_TABLE_NAME || 'Table1';
+const AIRTABLE_PAT = process.env.AIRTABLE_PAT!;
 
-const DEFAULT_CHATKIT_BASE = "https://api.openai.com";
-const SESSION_COOKIE_NAME = "chatkit_session_id";
-const SESSION_COOKIE_MAX_AGE = 60 * 60 * 24 * 30; // 30 days
+// Create one Airtable record per call
+async function logToAirtable(params: {
+  prompt: string;
+  response: string;
+  sessionId?: string;
+}) {
+  const { prompt, response, sessionId } = params;
 
-export async function POST(request: Request): Promise<Response> {
-  if (request.method !== "POST") {
-    return methodNotAllowedResponse();
-  }
-  let sessionCookie: string | null = null;
-  try {
-    const openaiApiKey = process.env.OPENAI_API_KEY;
-    if (!openaiApiKey) {
-      return new Response(
-        JSON.stringify({
-          error: "Missing OPENAI_API_KEY environment variable",
-        }),
-        {
-          status: 500,
-          headers: { "Content-Type": "application/json" },
-        }
-      );
-    }
+  const url = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${encodeURIComponent(
+    AIRTABLE_TABLE_NAME,
+  )}`;
 
-    const parsedBody = await safeParseJson<CreateSessionRequestBody>(request);
-    const { userId, sessionCookie: resolvedSessionCookie } =
-      await resolveUserId(request);
-    sessionCookie = resolvedSessionCookie;
-    const resolvedWorkflowId =
-      parsedBody?.workflow?.id ?? parsedBody?.workflowId ?? WORKFLOW_ID;
-
-    if (process.env.NODE_ENV !== "production") {
-      console.info("[create-session] handling request", {
-        resolvedWorkflowId,
-        body: JSON.stringify(parsedBody),
-      });
-    }
-
-    if (!resolvedWorkflowId) {
-      return buildJsonResponse(
-        { error: "Missing workflow id" },
-        400,
-        { "Content-Type": "application/json" },
-        sessionCookie
-      );
-    }
-
-    const apiBase = process.env.CHATKIT_API_BASE ?? DEFAULT_CHATKIT_BASE;
-    const url = `${apiBase}/v1/chatkit/sessions`;
-    const upstreamResponse = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${openaiApiKey}`,
-        "OpenAI-Beta": "chatkit_beta=v1",
+  const body = {
+    records: [
+      {
+        fields: {
+          // Field names must match Airtable exactly
+          Prompt: prompt,
+          Response: response,
+          SessionId: sessionId ?? '',
+        },
       },
-      body: JSON.stringify({
-        workflow: { id: resolvedWorkflowId },
-        user: userId,
-        chatkit_configuration: {
-          file_upload: {
-            enabled:
-              parsedBody?.chatkit_configuration?.file_upload?.enabled ?? false,
-          },
-        },
-      }),
-    });
+    ],
+  };
 
-    if (process.env.NODE_ENV !== "production") {
-      console.info("[create-session] upstream response", {
-        status: upstreamResponse.status,
-        statusText: upstreamResponse.statusText,
-      });
-    }
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${AIRTABLE_PAT}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
 
-    const upstreamJson = (await upstreamResponse.json().catch(() => ({}))) as
-      | Record<string, unknown>
-      | undefined;
+  if (!res.ok) {
+    const text = await res.text();
+    console.error('Failed to log to Airtable:', text);
+  }
+}
 
-    if (!upstreamResponse.ok) {
-      const upstreamError = extractUpstreamError(upstreamJson);
-      console.error("OpenAI ChatKit session creation failed", {
-        status: upstreamResponse.status,
-        statusText: upstreamResponse.statusText,
-        body: upstreamJson,
-      });
-      return buildJsonResponse(
-        {
-          error:
-            upstreamError ??
-            `Failed to create session: ${upstreamResponse.statusText}`,
-          details: upstreamJson,
-        },
-        upstreamResponse.status,
-        { "Content-Type": "application/json" },
-        sessionCookie
+export async function POST(req: NextRequest) {
+  try {
+    const { prompt, sessionId } = await req.json();
+
+    if (!prompt || typeof prompt !== 'string') {
+      return NextResponse.json(
+        { error: 'Missing prompt' },
+        { status: 400 },
       );
     }
 
-    const clientSecret = upstreamJson?.client_secret ?? null;
-    const expiresAfter = upstreamJson?.expires_after ?? null;
-    const responsePayload = {
-      client_secret: clientSecret,
-      expires_after: expiresAfter,
-    };
 
-    return buildJsonResponse(
-      responsePayload,
-      200,
-      { "Content-Type": "application/json" },
-      sessionCookie
+   // Call OpenAI Responses API
+const response = await openai.responses.create({
+  model: 'gpt-5.1',
+  instructions: `
+You are a professional automotive diagnostics assistant for DIY car owners.
+
+Your goals:
+- Be professional, concise, and easy to follow.
+- Reduce hallucinations and do NOT invent specific technical data you don't know
+  (e.g., exact part numbers, TSB IDs, torque specs, or service intervals).
+- Base your answer ONLY on the information provided by the user plus general
+  automotive best practices.
+- If something is uncertain, clearly say that it may vary and that an in-person
+  inspection by a qualified mechanic is recommended.
+- Assume the user has basic tools and safety awareness, but is not a professional.
+
+ALWAYS respond in **exactly** this structure and order:
+
+1. Brief summary of the issue  
+   - 2–3 sentences summarizing the symptom(s) in plain language.
+
+2. 3–5 most likely causes/solutions  
+   - Use a numbered list.  
+   - For each item, include: a short label + 1–2 sentence explanation.  
+   - Start with the simplest/most common causes first.
+
+3. 3–7 steps to properly diagnose the issue  
+   - Use a numbered list of clear, practical steps.  
+   - Start with simple visual/obvious checks before advanced tests.  
+   - Call out any steps that require a scan tool, jack stands, or professional help.
+
+4. Potential parts needed for the most likely fix  
+   - Use a bulleted list.  
+   - Use generic part names, not brand-specific SKUs.  
+   - List only parts that are truly plausible for the top 1–2 likely causes.
+
+Additional rules:
+- Do NOT give prices or cost estimates.  
+- Do NOT tell the user to ignore warning lights.  
+- If the problem involves brakes, steering, fuel leaks, or anything that could 
+  cause a breakdown or fire, explicitly recommend professional inspection.
+- Keep the total response reasonably concise (no long paragraphs; prefer short
+  paragraphs and bullets).`,
+  input: prompt,            // prompt should include year, make, model, mileage, and issue
+  max_output_tokens: 1250,   // adjust this up/down to control response length
+  temperature: 0.2          // lower temperature to reduce hallucinations
+});
+
+
+    // SDK convenience property to get all text
+    const answer = (response as any).output_text ?? 'No answer returned.';
+
+    // Log to Airtable (await so failures are visible in logs)
+    await logToAirtable({ prompt, response: answer, sessionId });
+
+    return NextResponse.json({ answer });
+  } catch (err: any) {
+    console.error('Error in /api/chat:', err);
+    return NextResponse.json(
+      { error: 'Server error', details: err?.message },
+      { status: 500 },
     );
-  } catch (error) {
-    console.error("Create session error", error);
-    return buildJsonResponse(
-      { error: "Unexpected error" },
-      500,
-      { "Content-Type": "application/json" },
-      sessionCookie
-    );
   }
-}
-
-export async function GET(): Promise<Response> {
-  return methodNotAllowedResponse();
-}
-
-function methodNotAllowedResponse(): Response {
-  return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
-    status: 405,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
-async function resolveUserId(request: Request): Promise<{
-  userId: string;
-  sessionCookie: string | null;
-}> {
-  const existing = getCookieValue(
-    request.headers.get("cookie"),
-    SESSION_COOKIE_NAME
-  );
-  if (existing) {
-    return { userId: existing, sessionCookie: null };
-  }
-
-  const generated =
-    typeof crypto.randomUUID === "function"
-      ? crypto.randomUUID()
-      : Math.random().toString(36).slice(2);
-
-  return {
-    userId: generated,
-    sessionCookie: serializeSessionCookie(generated),
-  };
-}
-
-function getCookieValue(
-  cookieHeader: string | null,
-  name: string
-): string | null {
-  if (!cookieHeader) {
-    return null;
-  }
-
-  const cookies = cookieHeader.split(";");
-  for (const cookie of cookies) {
-    const [rawName, ...rest] = cookie.split("=");
-    if (!rawName || rest.length === 0) {
-      continue;
-    }
-    if (rawName.trim() === name) {
-      return rest.join("=").trim();
-    }
-  }
-  return null;
-}
-
-function serializeSessionCookie(value: string): string {
-  const attributes = [
-    `${SESSION_COOKIE_NAME}=${encodeURIComponent(value)}`,
-    "Path=/",
-    `Max-Age=${SESSION_COOKIE_MAX_AGE}`,
-    "HttpOnly",
-    "SameSite=Lax",
-  ];
-
-  if (process.env.NODE_ENV === "production") {
-    attributes.push("Secure");
-  }
-  return attributes.join("; ");
-}
-
-function buildJsonResponse(
-  payload: unknown,
-  status: number,
-  headers: Record<string, string>,
-  sessionCookie: string | null
-): Response {
-  const responseHeaders = new Headers(headers);
-
-  if (sessionCookie) {
-    responseHeaders.append("Set-Cookie", sessionCookie);
-  }
-
-  return new Response(JSON.stringify(payload), {
-    status,
-    headers: responseHeaders,
-  });
-}
-
-async function safeParseJson<T>(req: Request): Promise<T | null> {
-  try {
-    const text = await req.text();
-    if (!text) {
-      return null;
-    }
-    return JSON.parse(text) as T;
-  } catch {
-    return null;
-  }
-}
-
-function extractUpstreamError(
-  payload: Record<string, unknown> | undefined
-): string | null {
-  if (!payload) {
-    return null;
-  }
-
-  const error = payload.error;
-  if (typeof error === "string") {
-    return error;
-  }
-
-  if (
-    error &&
-    typeof error === "object" &&
-    "message" in error &&
-    typeof (error as { message?: unknown }).message === "string"
-  ) {
-    return (error as { message: string }).message;
-  }
-
-  const details = payload.details;
-  if (typeof details === "string") {
-    return details;
-  }
-
-  if (details && typeof details === "object" && "error" in details) {
-    const nestedError = (details as { error?: unknown }).error;
-    if (typeof nestedError === "string") {
-      return nestedError;
-    }
-    if (
-      nestedError &&
-      typeof nestedError === "object" &&
-      "message" in nestedError &&
-      typeof (nestedError as { message?: unknown }).message === "string"
-    ) {
-      return (nestedError as { message: string }).message;
-    }
-  }
-
-  if (typeof payload.message === "string") {
-    return payload.message;
-  }
-  return null;
 }
